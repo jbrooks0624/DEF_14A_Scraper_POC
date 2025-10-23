@@ -151,32 +151,47 @@ async def process_company(company_name: str, status_placeholder) -> Dict:
         analysis_result = await analyze(relevant_text)
         
         # Parse and calculate
-        json_str = analysis_result
-        if '```json' in json_str:
-            json_str = json_str.split('```json')[1].split('```')[0].strip()
-        elif '```' in json_str:
-            json_str = json_str.split('```')[1].split('```')[0].strip()
+        try:
+            json_str = analysis_result
+            if '```json' in json_str:
+                json_str = json_str.split('```json')[1].split('```')[0].strip()
+            elif '```' in json_str:
+                json_str = json_str.split('```')[1].split('```')[0].strip()
+            
+            json_str = json_str.strip()
+            if json_str.startswith('{') and not json_str.startswith('['):
+                if '}\n{' in json_str or '},\n{' in json_str:
+                    json_str = '[' + json_str.replace('}\n{', '},\n{').replace('},\n{', '},\n{') + ']'
+                else:
+                    json_str = '[' + json_str + ']'
+            
+            payouts = json.loads(json_str)
+            if isinstance(payouts, dict):
+                payouts = [payouts]
+            
+            # Ensure all amounts are numeric and handle potential string values
+            total_payments = 0
+            for payout in payouts:
+                amount = payout.get('amount', 0)
+                # Convert to float if it's a string or int
+                if isinstance(amount, str):
+                    amount = float(amount.replace(',', '').replace('$', ''))
+                total_payments += float(amount) if amount else 0
+            
+            percentage = (total_payments / market_cap) * 100
+            
+            result['total_payments'] = total_payments
+            result['percentage'] = percentage
+            result['payouts'] = payouts
+            result['stage'] = 'complete'
+            
+            status_placeholder.success(f"✅ Analysis complete!")
         
-        json_str = json_str.strip()
-        if json_str.startswith('{') and not json_str.startswith('['):
-            if '}\n{' in json_str or '},\n{' in json_str:
-                json_str = '[' + json_str.replace('}\n{', '},\n{').replace('},\n{', '},\n{') + ']'
-            else:
-                json_str = '[' + json_str + ']'
-        
-        payouts = json.loads(json_str)
-        if isinstance(payouts, dict):
-            payouts = [payouts]
-        
-        total_payments = sum(payout.get('amount', 0) for payout in payouts)
-        percentage = (total_payments / market_cap) * 100
-        
-        result['total_payments'] = total_payments
-        result['percentage'] = percentage
-        result['payouts'] = payouts
-        result['stage'] = 'complete'
-        
-        status_placeholder.success(f"✅ Analysis complete!")
+        except (json.JSONDecodeError, ValueError, TypeError, KeyError) as parse_error:
+            # Failed to parse or calculate from the analysis result
+            result['error'] = "Failed to find change of control values from DEF 14A document"
+            status_placeholder.error(f"❌ {result['error']}")
+            return result
         
     except Exception as e:
         result['error'] = str(e)
