@@ -1,11 +1,18 @@
 import requests
 from bs4 import BeautifulSoup
+import time
 
 
 def scrape_html(url):
+    # SEC requires a proper User-Agent with contact information
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+        'User-Agent': 'Change of Control Analyzer brooks.joshua03@gmail.com',
+        'Accept-Encoding': 'gzip, deflate',
+        'Host': 'www.sec.gov'
     }
+    
+    # Respect SEC rate limits (10 requests per second max)
+    time.sleep(0.2)
     
     response = requests.get(url, headers=headers, timeout=30)
     response.raise_for_status()
