@@ -178,6 +178,12 @@ async def process_company(company_name: str, status_placeholder) -> Dict:
                     amount = float(amount.replace(',', '').replace('$', ''))
                 total_payments += float(amount) if amount else 0
             
+            # If we got 0 total, the analysis likely failed to extract values
+            if total_payments == 0:
+                result['error'] = "Failed to find change of control values from DEF 14A document"
+                status_placeholder.error(f"❌ {result['error']}")
+                return result
+            
             percentage = (total_payments / market_cap) * 100
             
             result['total_payments'] = total_payments
