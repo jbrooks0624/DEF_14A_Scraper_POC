@@ -253,17 +253,6 @@ def main():
         st.markdown("""
         **Enter a company name** to analyze their most recent DEF 14A proxy statement.
         
-        **Tips for best results:**
-        - Use the full legal company name (e.g., "Apple Inc." instead of "Apple")
-        - Try adding "Inc.", "Corp.", or "Corporation" if the short name doesn't work
-        - Only works with US public companies that file DEF 14A statements
-        
-        **Examples that work:**
-        - TreeHouse Foods
-        - Costco Wholesale
-        - Target Corporation
-        - Best Buy
-        
         **What this tool does:**
         1. 🔍 Searches SEC EDGAR for the company's most recent DEF 14A filing
         2. 💰 Fetches the current market capitalization
