@@ -83,7 +83,8 @@ async def process_company(company_name: str, status_placeholder) -> Dict:
         'percentage': None,
         'error': None,
         'stage': 'init',
-        'filing_date': None
+        'filing_date': None,
+        'def14a_url': None
     }
     
     try:
@@ -108,6 +109,7 @@ async def process_company(company_name: str, status_placeholder) -> Dict:
         
         result['ticker'] = filing_info['ticker']
         result['filing_date'] = filing_info['filing_date']
+        result['def14a_url'] = filing_info['url']
         sec_url = filing_info['url']
         
         status_placeholder.success(f"✅ Found DEF 14A (Filed: {filing_info['filing_date']})")
@@ -212,6 +214,18 @@ def display_result(company_name: str, result: Dict):
     display_name = result.get('company_name', company_name)
     st.markdown(f'<div class="company-header">{display_name}</div>', unsafe_allow_html=True)
     
+    # Display DEF 14A link if available (show even if there's an error)
+    if result.get('def14a_url'):
+        st.markdown(f"""
+            <div style="padding: 0.75rem; background-color: #f8f9fa; border-radius: 8px; border-left: 4px solid #2c5cc5; margin-bottom: 1rem;">
+                <div style="font-size: 0.85rem; color: #666; margin-bottom: 0.25rem;">📄 DEF 14A Proxy Statement</div>
+                <a href="{result['def14a_url']}" target="_blank" style="font-size: 0.9rem; text-decoration: none; color: #2c5cc5; font-weight: 500;">
+                    View SEC Filing →
+                </a>
+                {f'<div style="font-size: 0.8rem; color: #888; margin-top: 0.25rem;">Filed: {result["filing_date"]}</div>' if result.get('filing_date') else ''}
+            </div>
+        """, unsafe_allow_html=True)
+    
     if result.get('error'):
         st.error(f"❌ {result['error']}")
         
@@ -220,15 +234,14 @@ def display_result(company_name: str, result: Dict):
             st.info("💡 **Tip:** Try using the full legal name with 'Inc.', 'Corp.', or 'Corporation'")
         elif 'no def 14a' in result['error'].lower():
             st.info("💡 **Note:** This company may be private, foreign, or hasn't filed a proxy statement recently.")
+        elif 'failed to find change of control' in result['error'].lower():
+            st.info("💡 **Note:** The document was found but change of control values couldn't be extracted. You can review the document manually using the link above.")
         
         return
     
-    # Ticker and filing date
+    # Ticker info
     if result.get('ticker'):
-        ticker_info = f"**Ticker:** {result['ticker']}"
-        if result.get('filing_date'):
-            ticker_info += f" | **DEF 14A Filed:** {result['filing_date']}"
-        st.caption(ticker_info)
+        st.caption(f"**Ticker:** {result['ticker']}")
     
     # Market Cap
     if result.get('market_cap'):
