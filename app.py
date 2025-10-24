@@ -5,6 +5,7 @@ from scraper import scrape_html, extract_context_around_phrases
 from bs4 import BeautifulSoup
 from analyze_14a import analyze
 from edgar_api import find_def14a_url
+from database import save_analysis_result, get_top_companies
 import json
 from typing import Dict, Optional
 
@@ -59,6 +60,82 @@ st.markdown("""
         margin-bottom: 1rem;
         color: #1f1f1f;
         text-align: center;
+    }
+    .leaderboard-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 1rem 0;
+        background: white;
+        border-radius: 8px;
+        overflow: hidden;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    }
+    .leaderboard-table th {
+        background: linear-gradient(135deg, #2c5cc5 0%, #1e3a8a 100%);
+        color: white;
+        padding: 1rem;
+        text-align: left;
+        font-weight: 600;
+        font-size: 0.9rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+    .leaderboard-table td {
+        padding: 0.9rem 1rem;
+        border-bottom: 1px solid #f0f0f0;
+        font-size: 0.95rem;
+    }
+    .leaderboard-table tr:hover {
+        background-color: #f8f9fa;
+    }
+    .leaderboard-table tr:last-child td {
+        border-bottom: none;
+    }
+    .rank-badge {
+        display: inline-block;
+        width: 32px;
+        height: 32px;
+        line-height: 32px;
+        text-align: center;
+        border-radius: 50%;
+        font-weight: 700;
+        font-size: 0.85rem;
+    }
+    .rank-1 { background: linear-gradient(135deg, #ffd700 0%, #ffed4e 100%); color: #000; }
+    .rank-2 { background: linear-gradient(135deg, #c0c0c0 0%, #e8e8e8 100%); color: #000; }
+    .rank-3 { background: linear-gradient(135deg, #cd7f32 0%, #e8b687 100%); color: #fff; }
+    .rank-other { background: #e9ecef; color: #495057; }
+    .percent-badge {
+        display: inline-block;
+        background: #e3f2fd;
+        color: #1565c0;
+        padding: 0.4rem 0.8rem;
+        border-radius: 20px;
+        font-weight: 600;
+        font-size: 0.9rem;
+    }
+    .ticker-badge {
+        display: inline-block;
+        background: #f3e5f5;
+        color: #6a1b9a;
+        padding: 0.3rem 0.6rem;
+        border-radius: 4px;
+        font-weight: 600;
+        font-size: 0.8rem;
+        font-family: monospace;
+    }
+    .leaderboard-header {
+        text-align: center;
+        font-size: 1.8rem;
+        font-weight: 700;
+        margin: 2rem 0 1rem 0;
+        color: #1f1f1f;
+    }
+    .leaderboard-container {
+        background: #fafafa;
+        padding: 1.5rem;
+        border-radius: 12px;
+        margin-bottom: 2rem;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -193,6 +270,10 @@ async def process_company(company_name: str, status_placeholder) -> Dict:
             result['payouts'] = payouts
             result['stage'] = 'complete'
             
+            # Save to MongoDB if percentage is non-zero
+            if percentage > 0:
+                save_analysis_result(result)
+            
             status_placeholder.success(f"✅ Analysis complete!")
         
         except (json.JSONDecodeError, ValueError, TypeError, KeyError) as parse_error:
@@ -206,6 +287,47 @@ async def process_company(company_name: str, status_placeholder) -> Dict:
         status_placeholder.error(f"❌ Error: {str(e)}")
     
     return result
+
+
+def display_leaderboard():
+    """Display top 10 companies leaderboard in compact sidebar format"""
+    try:
+        top_companies = get_top_companies(10)
+        
+        if not top_companies:
+            st.caption("No companies analyzed yet.")
+            return
+        
+        # Compact list view for sidebar
+        for idx, company in enumerate(top_companies, 1):
+            rank_class = f"rank-{idx}" if idx <= 3 else "rank-other"
+            percent = company.get("percentage", 0)
+            ticker = company.get("ticker", "N/A")
+            company_name = company.get("company_name", "N/A")
+            doc_url = company.get("def14a_url", "")
+            
+            # Shorten company name if too long
+            if len(company_name) > 30:
+                company_name = company_name[:27] + "..."
+            
+            # Create compact card
+            card_html = f'''
+            <div style="background: white; padding: 0.75rem; margin-bottom: 0.5rem; border-radius: 8px; border-left: 4px solid {'#ffd700' if idx == 1 else '#c0c0c0' if idx == 2 else '#cd7f32' if idx == 3 else '#e9ecef'}; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.25rem;">
+                    <span class="rank-badge {rank_class}" style="font-size: 0.75rem; width: 24px; height: 24px; line-height: 24px;">{idx}</span>
+                    <span style="font-size: 0.85rem; font-weight: 600; color: #1565c0;">{percent:.4f}%</span>
+                </div>
+                <div style="font-size: 0.8rem; font-weight: 600; color: #1f1f1f; margin-bottom: 0.2rem;">{company_name}</div>
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span class="ticker-badge" style="font-size: 0.7rem; padding: 0.2rem 0.4rem;">{ticker}</span>
+                    {'<a href="' + doc_url + '" target="_blank" style="color: #2c5cc5; text-decoration: none; font-size: 0.75rem;">📄 View</a>' if doc_url else ''}
+                </div>
+            </div>
+            '''
+            st.markdown(card_html, unsafe_allow_html=True)
+        
+    except Exception as e:
+        st.caption(f"⚠️ Could not load leaderboard")
 
 
 def display_result(company_name: str, result: Dict):
@@ -279,6 +401,12 @@ async def process_all_companies(company_names, status_placeholders):
 
 
 def main():
+    # Sidebar with leaderboard
+    with st.sidebar:
+        st.markdown("### 🏆 Top 10 Leaderboard")
+        st.markdown("---")
+        display_leaderboard()
+    
     # Title
     st.markdown('<h1 class="main-title">Change of Control Analyzer</h1>', unsafe_allow_html=True)
     
