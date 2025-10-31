@@ -1,5 +1,7 @@
 import streamlit as st
 import asyncio
+import pandas as pd
+import io
 from ticker_finder import find_ticker, get_market_cap
 from scraper import scrape_html, extract_context_around_phrases
 from bs4 import BeautifulSoup
@@ -7,7 +9,8 @@ from analyze_14a import analyze
 from edgar_api import find_def14a_url
 from database import save_analysis_result, get_top_companies
 import json
-from typing import Dict, Optional
+from typing import Dict, Optional, List
+import time
 
 
 # Page config
@@ -137,6 +140,80 @@ st.markdown("""
         border-radius: 12px;
         margin-bottom: 2rem;
     }
+    .status-pending {
+        color: #666;
+        font-size: 0.9rem;
+    }
+    .status-processing {
+        color: #2c5cc5;
+        font-weight: 600;
+        font-size: 0.9rem;
+    }
+    .status-success {
+        color: #28a745;
+        font-weight: 600;
+        font-size: 0.9rem;
+    }
+    .status-error {
+        color: #dc3545;
+        font-weight: 600;
+        font-size: 0.9rem;
+    }
+    .summary-card {
+        background: white;
+        padding: 1.5rem;
+        border-radius: 10px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        text-align: center;
+    }
+    .summary-value {
+        font-size: 2.5rem;
+        font-weight: 700;
+        color: #2c5cc5;
+    }
+    .summary-label {
+        font-size: 0.9rem;
+        color: #666;
+        margin-top: 0.5rem;
+    }
+    /* Selector styling */
+    div[data-testid="stSelectbox"] {
+        background: white;
+        border-radius: 8px;
+        padding: 0.25rem;
+    }
+    div[data-testid="stSelectbox"] > div {
+        background: linear-gradient(135deg, #f8f9fa 0%, #ffffff 100%);
+        border: 2px solid #2c5cc5;
+        border-radius: 6px;
+    }
+    /* Download button styling */
+    .download-btn {
+        display: inline-block;
+        padding: 0.5rem 1rem;
+        background: linear-gradient(135deg, #2c5cc5 0%, #1e3a8a 100%);
+        color: white;
+        text-decoration: none;
+        border-radius: 6px;
+        font-weight: 600;
+        font-size: 0.9rem;
+        transition: transform 0.2s;
+    }
+    .download-btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(44, 92, 197, 0.3);
+    }
+    /* Stop button styling */
+    button[kind="secondary"] {
+        background: linear-gradient(135deg, #dc3545 0%, #c82333 100%) !important;
+        color: white !important;
+        font-weight: 600 !important;
+        border: none !important;
+    }
+    button[kind="secondary"]:hover {
+        background: linear-gradient(135deg, #c82333 0%, #bd2130 100%) !important;
+        box-shadow: 0 4px 12px rgba(220, 53, 69, 0.3) !important;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -148,9 +225,19 @@ if 'running' not in st.session_state:
     st.session_state.running = False
 if 'results' not in st.session_state:
     st.session_state.results = {}
+if 'batch_running' not in st.session_state:
+    st.session_state.batch_running = False
+if 'batch_results' not in st.session_state:
+    st.session_state.batch_results = []
+if 'batch_progress' not in st.session_state:
+    st.session_state.batch_progress = {}
+if 'uploaded_df' not in st.session_state:
+    st.session_state.uploaded_df = None
+if 'stop_requested' not in st.session_state:
+    st.session_state.stop_requested = False
 
 
-async def process_company(company_name: str, status_placeholder) -> Dict:
+async def process_company(company_name: str, status_placeholder=None) -> Dict:
     """Process a single company and return results"""
     result = {
         'company_name': company_name,
@@ -167,7 +254,8 @@ async def process_company(company_name: str, status_placeholder) -> Dict:
     try:
         # Step 1: Find DEF 14A filing
         result['stage'] = 'finding_def14a'
-        status_placeholder.info("🔄 Searching for DEF 14A filing...")
+        if status_placeholder:
+            status_placeholder.info("🔄 Searching for DEF 14A filing...")
         
         filing_info = find_def14a_url(company_name, verbose=False)
         
@@ -176,12 +264,14 @@ async def process_company(company_name: str, status_placeholder) -> Dict:
             result['error'] = filing_info.get('error_detail', 'Could not find DEF 14A filing')
             result['company_name'] = filing_info.get('company_name', company_name)
             result['ticker'] = filing_info.get('ticker')
-            status_placeholder.error(f"❌ {result['error']}")
+            if status_placeholder:
+                status_placeholder.error(f"❌ {result['error']}")
             return result
         
         if not filing_info:
             result['error'] = "Could not find DEF 14A filing for this company"
-            status_placeholder.error(f"❌ {result['error']}")
+            if status_placeholder:
+                status_placeholder.error(f"❌ {result['error']}")
             return result
         
         result['ticker'] = filing_info['ticker']
@@ -189,27 +279,32 @@ async def process_company(company_name: str, status_placeholder) -> Dict:
         result['def14a_url'] = filing_info['url']
         sec_url = filing_info['url']
         
-        status_placeholder.success(f"✅ Found DEF 14A (Filed: {filing_info['filing_date']})")
-        await asyncio.sleep(0.1)  # Brief pause for visual feedback
+        if status_placeholder:
+            status_placeholder.success(f"✅ Found DEF 14A (Filed: {filing_info['filing_date']})")
+            await asyncio.sleep(0.1)  # Brief pause for visual feedback
         
         # Step 2: Get market cap
         result['stage'] = 'fetching_market_cap'
-        status_placeholder.info("🔄 Fetching market cap...")
+        if status_placeholder:
+            status_placeholder.info("🔄 Fetching market cap...")
         
         market_cap = get_market_cap(result['ticker'])
         if not market_cap:
             result['error'] = "Could not fetch market cap"
-            status_placeholder.error(f"❌ {result['error']}")
+            if status_placeholder:
+                status_placeholder.error(f"❌ {result['error']}")
             return result
         result['market_cap'] = market_cap
         
         # Show market cap
-        status_placeholder.success(f"✅ Market Cap: ${market_cap:,}")
-        await asyncio.sleep(0.1)  # Brief pause for visual feedback
+        if status_placeholder:
+            status_placeholder.success(f"✅ Market Cap: ${market_cap:,}")
+            await asyncio.sleep(0.1)  # Brief pause for visual feedback
         
         # Step 3: Scrape and analyze
         result['stage'] = 'fetching_coc'
-        status_placeholder.info("🔄 Analyzing change in control information...")
+        if status_placeholder:
+            status_placeholder.info("🔄 Analyzing change in control information...")
         
         # Scrape SEC filing
         html = scrape_html(sec_url)
@@ -260,7 +355,8 @@ async def process_company(company_name: str, status_placeholder) -> Dict:
             # If we got 0 total, the analysis likely failed to extract values
             if total_payments == 0:
                 result['error'] = "Failed to find change of control values from DEF 14A document"
-                status_placeholder.error(f"❌ {result['error']}")
+                if status_placeholder:
+                    status_placeholder.error(f"❌ {result['error']}")
                 return result
             
             percentage = (total_payments / market_cap) * 100
@@ -274,29 +370,463 @@ async def process_company(company_name: str, status_placeholder) -> Dict:
             if percentage > 0:
                 save_analysis_result(result)
             
-            status_placeholder.success(f"✅ Analysis complete!")
+            if status_placeholder:
+                status_placeholder.success(f"✅ Analysis complete!")
         
         except (json.JSONDecodeError, ValueError, TypeError, KeyError) as parse_error:
             # Failed to parse or calculate from the analysis result
             result['error'] = "Failed to find change of control values from DEF 14A document"
-            status_placeholder.error(f"❌ {result['error']}")
+            if status_placeholder:
+                status_placeholder.error(f"❌ {result['error']}")
             return result
         
     except Exception as e:
         result['error'] = str(e)
-        status_placeholder.error(f"❌ Error: {str(e)}")
+        if status_placeholder:
+            status_placeholder.error(f"❌ Error: {str(e)}")
     
     return result
 
 
-def display_leaderboard():
-    """Display top 10 companies leaderboard in compact sidebar format"""
+async def process_batch_companies(company_names: List[str], progress_container, status_table_container):
+    """Process companies in small batches and update progress"""
+    results = []
+    batch_size = 3  # Process 3 companies at a time
+    total = len(company_names)
+    
+    # Create status tracking
+    status_dict = {name: {'status': 'Pending', 'stage': '', 'percentage': None} for name in company_names}
+    
+    # Progress bar
+    progress_bar = progress_container.progress(0)
+    progress_text = progress_container.empty()
+    
+    for i in range(0, total, batch_size):
+        # Check if stop was requested
+        if st.session_state.stop_requested:
+            # Mark remaining companies as cancelled
+            for j in range(i, total):
+                company_name = company_names[j]
+                if status_dict[company_name]['status'] == 'Pending':
+                    status_dict[company_name]['status'] = 'Cancelled'
+                    status_dict[company_name]['stage'] = 'Stopped by user'
+            
+            update_status_table(status_table_container, status_dict, company_names)
+            completed = len([r for r in results if r.get('percentage') is not None or r.get('error') is not None])
+            progress_text.markdown(f"**⏸️ Stopped: {completed} / {total} companies completed before stop**")
+            break
+        
+        batch = company_names[i:i+batch_size]
+        batch_results = []
+        
+        # Update status to processing for current batch
+        for company in batch:
+            status_dict[company]['status'] = 'Processing'
+            status_dict[company]['stage'] = 'Starting...'
+        
+        # Update status table
+        update_status_table(status_table_container, status_dict, company_names)
+        
+        # Process batch concurrently
+        tasks = []
+        for company in batch:
+            tasks.append(process_company_with_status_update(company, status_dict, status_table_container, company_names))
+        
+        batch_results = await asyncio.gather(*tasks)
+        results.extend(batch_results)
+        
+        # Update progress
+        completed = min(i + batch_size, total)
+        progress = completed / total
+        progress_bar.progress(progress)
+        progress_text.markdown(f"**Processing: {completed} / {total} companies ({progress*100:.0f}%)**")
+        
+        # Small delay between batches to avoid rate limiting
+        if i + batch_size < total:
+            await asyncio.sleep(1)
+    
+    if not st.session_state.stop_requested:
+        progress_text.markdown(f"**✅ Complete: {total} / {total} companies (100%)**")
+    
+    return results
+
+
+async def process_company_with_status_update(company_name: str, status_dict: dict, status_table_container, all_companies: List[str]):
+    """Process a company and update status in real-time"""
+    
+    # Update stages as we go
+    stages = {
+        'finding_def14a': 'Finding DEF 14A...',
+        'fetching_market_cap': 'Fetching market cap...',
+        'fetching_coc': 'Analyzing CoC...',
+        'complete': 'Complete',
+        'error': 'Error'
+    }
+    
+    result = {
+        'company_name': company_name,
+        'ticker': None,
+        'market_cap': None,
+        'total_payments': None,
+        'percentage': None,
+        'error': None,
+        'stage': 'init',
+        'filing_date': None,
+        'def14a_url': None
+    }
+    
     try:
-        top_companies = get_top_companies(10)
+        # Step 1: Find DEF 14A filing
+        result['stage'] = 'finding_def14a'
+        status_dict[company_name]['stage'] = stages['finding_def14a']
+        update_status_table(status_table_container, status_dict, all_companies)
+        
+        filing_info = find_def14a_url(company_name, verbose=False)
+        
+        if filing_info and 'error' in filing_info:
+            result['error'] = filing_info.get('error_detail', 'Could not find DEF 14A filing')
+            result['company_name'] = filing_info.get('company_name', company_name)
+            result['ticker'] = filing_info.get('ticker')
+            status_dict[company_name]['status'] = 'Error'
+            status_dict[company_name]['stage'] = result['error'][:50]
+            update_status_table(status_table_container, status_dict, all_companies)
+            return result
+        
+        if not filing_info:
+            result['error'] = "Could not find DEF 14A filing"
+            status_dict[company_name]['status'] = 'Error'
+            status_dict[company_name]['stage'] = 'No DEF 14A found'
+            update_status_table(status_table_container, status_dict, all_companies)
+            return result
+        
+        result['ticker'] = filing_info['ticker']
+        result['filing_date'] = filing_info['filing_date']
+        result['def14a_url'] = filing_info['url']
+        sec_url = filing_info['url']
+        
+        # Step 2: Get market cap
+        result['stage'] = 'fetching_market_cap'
+        status_dict[company_name]['stage'] = stages['fetching_market_cap']
+        update_status_table(status_table_container, status_dict, all_companies)
+        
+        market_cap = get_market_cap(result['ticker'])
+        if not market_cap:
+            result['error'] = "Could not fetch market cap"
+            status_dict[company_name]['status'] = 'Error'
+            status_dict[company_name]['stage'] = 'No market cap'
+            update_status_table(status_table_container, status_dict, all_companies)
+            return result
+        result['market_cap'] = market_cap
+        
+        # Step 3: Scrape and analyze
+        result['stage'] = 'fetching_coc'
+        status_dict[company_name]['stage'] = stages['fetching_coc']
+        update_status_table(status_table_container, status_dict, all_companies)
+        
+        html = scrape_html(sec_url)
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        for script in soup(['script', 'style']):
+            script.decompose()
+        
+        text = soup.get_text()
+        lines = (line.strip() for line in text.splitlines())
+        text = '\n'.join(line for line in lines if line)
+        
+        search_phrases = ['change in control', 'change of control']
+        text_blocks = extract_context_around_phrases(text, search_phrases, context_chars=1000)
+        relevant_text = '\n\n'.join(text_blocks)
+        
+        analysis_result = await analyze(relevant_text)
+        
+        try:
+            json_str = analysis_result
+            if '```json' in json_str:
+                json_str = json_str.split('```json')[1].split('```')[0].strip()
+            elif '```' in json_str:
+                json_str = json_str.split('```')[1].split('```')[0].strip()
+            
+            json_str = json_str.strip()
+            if json_str.startswith('{') and not json_str.startswith('['):
+                if '}\n{' in json_str or '},\n{' in json_str:
+                    json_str = '[' + json_str.replace('}\n{', '},\n{').replace('},\n{', '},\n{') + ']'
+                else:
+                    json_str = '[' + json_str + ']'
+            
+            payouts = json.loads(json_str)
+            if isinstance(payouts, dict):
+                payouts = [payouts]
+            
+            total_payments = 0
+            for payout in payouts:
+                amount = payout.get('amount', 0)
+                if isinstance(amount, str):
+                    amount = float(amount.replace(',', '').replace('$', ''))
+                total_payments += float(amount) if amount else 0
+            
+            if total_payments == 0:
+                result['error'] = "Failed to find CoC values"
+                status_dict[company_name]['status'] = 'Error'
+                status_dict[company_name]['stage'] = 'No CoC values found'
+                update_status_table(status_table_container, status_dict, all_companies)
+                return result
+            
+            percentage = (total_payments / market_cap) * 100
+            
+            result['total_payments'] = total_payments
+            result['percentage'] = percentage
+            result['payouts'] = payouts
+            result['stage'] = 'complete'
+            
+            # Save to database
+            if percentage > 0:
+                save_analysis_result(result)
+            
+            status_dict[company_name]['status'] = 'Complete'
+            status_dict[company_name]['stage'] = f'{percentage:.4f}%'
+            status_dict[company_name]['percentage'] = percentage
+            update_status_table(status_table_container, status_dict, all_companies)
+        
+        except (json.JSONDecodeError, ValueError, TypeError, KeyError):
+            result['error'] = "Failed to find CoC values"
+            status_dict[company_name]['status'] = 'Error'
+            status_dict[company_name]['stage'] = 'Parse error'
+            update_status_table(status_table_container, status_dict, all_companies)
+            return result
+        
+    except Exception as e:
+        result['error'] = str(e)
+        status_dict[company_name]['status'] = 'Error'
+        status_dict[company_name]['stage'] = str(e)[:50]
+        update_status_table(status_table_container, status_dict, all_companies)
+    
+    return result
+
+
+def update_status_table(container, status_dict: dict, company_order: List[str]):
+    """Update the status table display"""
+    
+    rows = []
+    for company in company_order:
+        status_info = status_dict[company]
+        status = status_info['status']
+        stage = status_info['stage']
+        
+        # Style based on status
+        if status == 'Complete':
+            status_html = f'<span class="status-success">✅ {status}</span>'
+            stage_html = f'<span class="status-success">{stage}</span>'
+        elif status == 'Error':
+            status_html = f'<span class="status-error">❌ {status}</span>'
+            stage_html = f'<span class="status-error">{stage}</span>'
+        elif status == 'Processing':
+            status_html = f'<span class="status-processing">🔄 {status}</span>'
+            stage_html = f'<span class="status-processing">{stage}</span>'
+        elif status == 'Cancelled':
+            status_html = f'<span class="status-pending">⏸️ {status}</span>'
+            stage_html = f'<span class="status-pending">{stage}</span>'
+        else:
+            status_html = f'<span class="status-pending">⏳ {status}</span>'
+            stage_html = f'<span class="status-pending">-</span>'
+        
+        rows.append(f"<tr><td>{company}</td><td>{status_html}</td><td>{stage_html}</td></tr>")
+    
+    table_html = f"""
+    <table class="leaderboard-table">
+        <thead>
+            <tr>
+                <th>Company Name</th>
+                <th>Status</th>
+                <th>Progress</th>
+            </tr>
+        </thead>
+        <tbody>
+            {''.join(rows)}
+        </tbody>
+    </table>
+    """
+    
+    container.markdown(table_html, unsafe_allow_html=True)
+
+
+def display_batch_results_summary(results: List[Dict]):
+    """Display summary and top N results from batch processing"""
+    
+    # Calculate statistics
+    successful = [r for r in results if r.get('percentage') is not None]
+    failed = [r for r in results if r.get('error') is not None]
+    
+    total = len(results)
+    success_count = len(successful)
+    failed_count = len(failed)
+    avg_percentage = sum(r['percentage'] for r in successful) / success_count if success_count > 0 else 0
+    
+    # Check if processing was stopped early
+    was_stopped = st.session_state.get('stop_requested', False) or (success_count + failed_count < total)
+    
+    # Display summary cards
+    if was_stopped:
+        st.markdown("### 📊 Batch Processing Summary (Stopped)")
+        st.info("⏸️ **Processing was stopped.** Results shown are for completed companies only.")
+    else:
+        st.markdown("### 📊 Batch Processing Summary")
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    cols = st.columns(4)
+    
+    with cols[0]:
+        st.markdown(f"""
+        <div class="summary-card">
+            <div class="summary-value">{total}</div>
+            <div class="summary-label">Total</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with cols[1]:
+        st.markdown(f"""
+        <div class="summary-card">
+            <div class="summary-value" style="color: #28a745;">{success_count}</div>
+            <div class="summary-label">Successful</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with cols[2]:
+        st.markdown(f"""
+        <div class="summary-card">
+            <div class="summary-value" style="color: #dc3545;">{failed_count}</div>
+            <div class="summary-label">Failed</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with cols[3]:
+        st.markdown(f"""
+        <div class="summary-card">
+            <div class="summary-value">{avg_percentage:.4f}%</div>
+            <div class="summary-label">Average</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # Display top N results
+    if successful:
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        
+        # Header with selector
+        header_col1, header_col2, header_col3 = st.columns([2, 1, 2])
+        
+        with header_col1:
+            st.markdown('<div class="leaderboard-header" style="text-align: left; margin: 0;">🏆 Top Results</div>', unsafe_allow_html=True)
+        
+        with header_col2:
+            # Selector for top N
+            top_n_options = [10, 20, 50]
+            # Limit options based on actual successful results
+            available_options = [n for n in top_n_options if n <= success_count]
+            if not available_options:
+                available_options = [success_count]
+            elif success_count not in available_options and success_count < 50:
+                available_options.append(success_count)
+                available_options.sort()
+            
+            top_n = st.selectbox(
+                "Show top:",
+                options=available_options,
+                index=0,
+                key="top_n_selector",
+                label_visibility="collapsed"
+            )
+        
+        with header_col3:
+            st.markdown(f'<div style="text-align: right; color: #666; font-size: 0.9rem; padding-top: 0.5rem;">Showing {min(top_n, success_count)} of {success_count} successful</div>', unsafe_allow_html=True)
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        # Sort by percentage and get top N
+        sorted_results = sorted(successful, key=lambda x: x['percentage'], reverse=True)
+        top_results = sorted_results[:top_n]
+        
+        rows = []
+        for idx, company in enumerate(top_results, 1):
+            rank_class = f"rank-{idx}" if idx <= 3 else "rank-other"
+            medal = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else ""
+            
+            company_name = company.get('company_name', 'N/A')
+            ticker = company.get('ticker', 'N/A')
+            percentage = company.get('percentage', 0)
+            market_cap = company.get('market_cap', 0)
+            doc_url = company.get('def14a_url', '')
+            
+            # Truncate long company names
+            if len(company_name) > 45:
+                company_name = company_name[:42] + "..."
+            
+            rows.append(f"""
+            <tr>
+                <td><span class="rank-badge {rank_class}">{medal if medal else idx}</span></td>
+                <td><strong>{company_name}</strong></td>
+                <td><span class="ticker-badge">{ticker}</span></td>
+                <td><span class="percent-badge">{percentage:.4f}%</span></td>
+                <td>${market_cap:,}</td>
+                <td>{'<a href="' + doc_url + '" target="_blank" style="color: #2c5cc5; text-decoration: none; font-weight: 500;">📄 View Filing</a>' if doc_url else '-'}</td>
+            </tr>
+            """)
+        
+        table_html = f"""
+        <div class="leaderboard-container">
+            <table class="leaderboard-table">
+                <thead>
+                    <tr>
+                        <th style="width: 60px;">#</th>
+                        <th style="width: 35%;">Company Name</th>
+                        <th style="width: 10%;">Ticker</th>
+                        <th style="width: 15%;">Percentage</th>
+                        <th style="width: 20%;">Market Cap</th>
+                        <th style="width: 15%;">Filing</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {''.join(rows)}
+                </tbody>
+            </table>
+        </div>
+        """
+        
+        st.markdown(table_html, unsafe_allow_html=True)
+    
+    # Show failed companies if any
+    if failed:
+        st.markdown("<br>", unsafe_allow_html=True)
+        with st.expander(f"⚠️ View Failed Companies ({failed_count})"):
+            for company in failed:
+                st.text(f"• {company['company_name']}: {company.get('error', 'Unknown error')}")
+
+
+def display_leaderboard():
+    """Display top N companies leaderboard in compact sidebar format"""
+    try:
+        # Initialize session state for sidebar leaderboard count
+        if 'sidebar_top_n' not in st.session_state:
+            st.session_state.sidebar_top_n = 10
+        
+        # Selector for top N
+        top_n = st.selectbox(
+            "Show top:",
+            options=[10, 20, 50],
+            index=[10, 20, 50].index(st.session_state.sidebar_top_n) if st.session_state.sidebar_top_n in [10, 20, 50] else 0,
+            key="sidebar_leaderboard_selector",
+            help="Select how many companies to display"
+        )
+        
+        st.session_state.sidebar_top_n = top_n
+        
+        # Fetch top N companies
+        top_companies = get_top_companies(top_n)
         
         if not top_companies:
             st.caption("No companies analyzed yet.")
             return
+        
+        st.caption(f"Showing top {len(top_companies)} companies")
+        st.markdown("---")
         
         # Compact list view for sidebar
         for idx, company in enumerate(top_companies, 1):
@@ -400,15 +930,8 @@ async def process_all_companies(company_names, status_placeholders):
     return {name: result for name, result in zip(company_names, results) if name.strip()}
 
 
-def main():
-    # Sidebar with leaderboard
-    with st.sidebar:
-        st.markdown("### 🏆 Top 10 Leaderboard")
-        st.markdown("---")
-        display_leaderboard()
-    
-    # Title
-    st.markdown('<h1 class="main-title">Change of Control Analyzer</h1>', unsafe_allow_html=True)
+def manual_input_tab():
+    """Display the manual input interface"""
     
     # Help section
     with st.expander("💡 How to use this tool", expanded=False):
@@ -458,7 +981,7 @@ def main():
     button_cols = st.columns([1, 1, 3])
     
     with button_cols[0]:
-        if st.button("🔍 Analyze", disabled=st.session_state.running, use_container_width=True, type="primary"):
+        if st.button("🔍 Analyze", disabled=st.session_state.running, width='stretch', type="primary", key="manual_analyze"):
             # Filter out empty names
             valid_names = [name for name in company_names if name.strip()]
             
@@ -470,7 +993,7 @@ def main():
                 st.rerun()
     
     with button_cols[1]:
-        if st.button("🗑️ Clear", disabled=not st.session_state.results, use_container_width=True):
+        if st.button("🗑️ Clear", disabled=not st.session_state.results, width='stretch', key="manual_clear"):
             st.session_state.num_inputs = 1
             st.session_state.running = False
             st.session_state.results = {}
@@ -521,6 +1044,185 @@ def main():
                 display_result(company_name, result)
 
 
+def batch_upload_tab():
+    """Display the batch upload interface"""
+    
+    st.markdown("### 📁 Batch Upload")
+    st.markdown("Upload an Excel or CSV file containing company names for batch analysis.")
+    
+    # File upload
+    uploaded_file = st.file_uploader(
+        "Choose a file",
+        type=['xlsx', 'xls', 'csv'],
+        disabled=st.session_state.batch_running,
+        key="file_uploader"
+    )
+    
+    if uploaded_file is not None:
+        try:
+            # Read the file
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file)
+            else:
+                df = pd.read_excel(uploaded_file)
+            
+            st.session_state.uploaded_df = df
+            
+            # Show preview
+            st.success(f"✅ File loaded successfully! Found {len(df)} rows.")
+            
+            with st.expander("📋 Preview Data", expanded=True):
+                st.dataframe(df.head(), width='stretch')
+            
+            # Column name input
+            st.markdown("---")
+            st.markdown("### ⚙️ Configuration")
+            
+            # Check if "Company Name" column exists
+            default_column = "Company Name" if "Company Name" in df.columns else ""
+            
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                column_name = st.text_input(
+                    "Enter the column name containing company names:",
+                    value=default_column,
+                    disabled=st.session_state.batch_running,
+                    placeholder="e.g., Company Name, Company, Name",
+                    key="column_input"
+                )
+            
+            with col2:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("Show Available Columns", disabled=st.session_state.batch_running):
+                    st.info(f"Available columns: {', '.join(df.columns.tolist())}")
+            
+            if column_name:
+                if column_name in df.columns:
+                    # Get company names from column
+                    company_names = df[column_name].dropna().astype(str).tolist()
+                    company_names = [name.strip() for name in company_names if name.strip()]
+                    
+                    # Limit to 200
+                    if len(company_names) > 200:
+                        st.warning(f"⚠️ Found {len(company_names)} companies. Limiting to first 200.")
+                        company_names = company_names[:200]
+                    
+                    st.success(f"✅ Found {len(company_names)} companies to analyze")
+                    
+                    # Show preview of companies
+                    with st.expander("👁️ Preview Companies", expanded=False):
+                        preview_cols = st.columns(3)
+                        for idx, name in enumerate(company_names[:15]):
+                            with preview_cols[idx % 3]:
+                                st.text(f"• {name}")
+                        if len(company_names) > 15:
+                            st.caption(f"... and {len(company_names) - 15} more")
+                    
+                    # Action buttons
+                    st.markdown("---")
+                    button_cols = st.columns([1, 1, 3])
+                    
+                    with button_cols[0]:
+                        if st.button(
+                            "🔍 Analyze All Companies",
+                            disabled=st.session_state.batch_running,
+                            width='stretch',
+                            type="primary",
+                            key="batch_analyze"
+                        ):
+                            st.session_state.batch_running = True
+                            st.session_state.batch_results = []
+                            st.session_state.stop_requested = False  # Reset stop flag
+                            st.rerun()
+                    
+                    with button_cols[1]:
+                        if st.button(
+                            "🗑️ Clear Results",
+                            disabled=not st.session_state.batch_results,
+                            width='stretch',
+                            key="batch_clear"
+                        ):
+                            st.session_state.batch_running = False
+                            st.session_state.batch_results = []
+                            st.session_state.uploaded_df = None
+                            st.rerun()
+                    
+                    # Process batch
+                    if st.session_state.batch_running:
+                        st.markdown("---")
+                        
+                        # Header with Stop button
+                        header_col1, header_col2 = st.columns([3, 1])
+                        with header_col1:
+                            st.markdown("### 🔄 Processing Batch")
+                        with header_col2:
+                            if st.button("⏹️ Stop", type="secondary", width='stretch', key="stop_batch"):
+                                st.session_state.stop_requested = True
+                                st.rerun()
+                        
+                        progress_container = st.container()
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        status_table_container = st.empty()
+                        
+                        async def run_batch():
+                            results = await process_batch_companies(
+                                company_names,
+                                progress_container,
+                                status_table_container
+                            )
+                            return results
+                        
+                        results = asyncio.run(run_batch())
+                        st.session_state.batch_results = results
+                        st.session_state.batch_running = False
+                        st.session_state.stop_requested = False  # Reset stop flag
+                        st.rerun()
+                    
+                    # Display results
+                    if st.session_state.batch_results and not st.session_state.batch_running:
+                        st.markdown("---")
+                        display_batch_results_summary(st.session_state.batch_results)
+                
+                else:
+                    st.error(f"❌ Column '{column_name}' not found in the file.")
+                    st.info(f"Available columns: {', '.join(df.columns.tolist())}")
+        
+        except Exception as e:
+            st.error(f"❌ Error reading file: {str(e)}")
+    
+    else:
+        # Instructions when no file is uploaded
+        st.info("""
+        **📝 Instructions:**
+        1. Upload an Excel (.xlsx, .xls) or CSV file
+        2. Enter the column name containing company names
+        3. Click "Analyze All Companies" to start batch processing
+        4. View results and top performers when complete
+        
+        **⚠️ Note:** Maximum 200 companies per batch
+        """)
+
+
+def main():
+    # Sidebar with leaderboard
+    with st.sidebar:
+        st.markdown("### 🏆 Leaderboard")
+        st.markdown("---")
+        display_leaderboard()
+    
+    # Title
+    st.markdown('<h1 class="main-title">Change of Control Analyzer</h1>', unsafe_allow_html=True)
+    
+    # Tabs for Manual vs Batch
+    tab1, tab2 = st.tabs(["✍️ Manual Input", "📁 Batch Upload"])
+    
+    with tab1:
+        manual_input_tab()
+    
+    with tab2:
+        batch_upload_tab()
+
+
 if __name__ == "__main__":
     main()
-
