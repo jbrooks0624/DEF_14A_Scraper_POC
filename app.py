@@ -11,6 +11,7 @@ from database import save_analysis_result, get_top_companies
 import json
 from typing import Dict, Optional, List
 import time
+from datetime import datetime
 
 
 # Page config
@@ -237,6 +238,26 @@ if 'stop_requested' not in st.session_state:
     st.session_state.stop_requested = False
 
 
+def log_error(company_name: str, stage: str, error_message: str, details: str = ""):
+    """Log detailed error information to terminal"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    separator = "=" * 80
+    print(f"\n{separator}")
+    print(f"❌ ERROR | {timestamp}")
+    print(f"Company: {company_name}")
+    print(f"Stage: {stage}")
+    print(f"Error: {error_message}")
+    if details:
+        print(f"Details: {details}")
+    print(separator)
+
+
+def log_success(company_name: str, ticker: str, percentage: float):
+    """Log successful processing to terminal"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"✅ SUCCESS | {timestamp} | {company_name} ({ticker}) → {percentage:.4f}%")
+
+
 async def process_company(company_name: str, status_placeholder=None) -> Dict:
     """Process a single company and return results"""
     result = {
@@ -454,6 +475,13 @@ async def process_batch_companies(company_names: List[str], progress_container, 
 async def process_company_with_status_update(company_name: str, status_dict: dict, status_table_container, all_companies: List[str]):
     """Process a company and update status in real-time"""
     
+    # Log start of processing
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n🔵 START | {timestamp} | Processing: {company_name}")
+    
+    # Store original company name
+    original_company_name = company_name
+    
     # Update stages as we go
     stages = {
         'finding_def14a': 'Finding DEF 14A...',
@@ -464,7 +492,7 @@ async def process_company_with_status_update(company_name: str, status_dict: dic
     }
     
     result = {
-        'company_name': company_name,
+        'company_name': original_company_name,  # Always use the original input name
         'ticker': None,
         'market_cap': None,
         'total_payments': None,
@@ -485,11 +513,19 @@ async def process_company_with_status_update(company_name: str, status_dict: dic
         
         if filing_info and 'error' in filing_info:
             result['error'] = filing_info.get('error_detail', 'Could not find DEF 14A filing')
-            result['company_name'] = filing_info.get('company_name', company_name)
+            # Keep original company name, don't overwrite
             result['ticker'] = filing_info.get('ticker')
             status_dict[company_name]['status'] = 'Error'
             status_dict[company_name]['stage'] = result['error'][:50]
             update_status_table(status_table_container, status_dict, all_companies)
+            
+            # Log detailed error
+            log_error(
+                original_company_name,
+                "DEF 14A Filing Search",
+                result['error'],
+                f"Ticker: {result['ticker'] or 'Not found'} | Error Type: {filing_info.get('error', 'Unknown')}"
+            )
             return result
         
         if not filing_info:
@@ -497,6 +533,13 @@ async def process_company_with_status_update(company_name: str, status_dict: dic
             status_dict[company_name]['status'] = 'Error'
             status_dict[company_name]['stage'] = 'No DEF 14A found'
             update_status_table(status_table_container, status_dict, all_companies)
+            
+            log_error(
+                original_company_name,
+                "DEF 14A Filing Search",
+                "No filing information returned",
+                "The SEC EDGAR API returned no results for this company"
+            )
             return result
         
         result['ticker'] = filing_info['ticker']
@@ -515,6 +558,13 @@ async def process_company_with_status_update(company_name: str, status_dict: dic
             status_dict[company_name]['status'] = 'Error'
             status_dict[company_name]['stage'] = 'No market cap'
             update_status_table(status_table_container, status_dict, all_companies)
+            
+            log_error(
+                original_company_name,
+                "Market Cap Fetch",
+                "Failed to retrieve market cap from Yahoo Finance",
+                f"Ticker: {result['ticker']} | Filing Date: {result['filing_date']} | This could be due to: delisted stock, incorrect ticker, or API issues"
+            )
             return result
         result['market_cap'] = market_cap
         
@@ -523,24 +573,78 @@ async def process_company_with_status_update(company_name: str, status_dict: dic
         status_dict[company_name]['stage'] = stages['fetching_coc']
         update_status_table(status_table_container, status_dict, all_companies)
         
-        html = scrape_html(sec_url)
-        soup = BeautifulSoup(html, 'html.parser')
+        try:
+            html = scrape_html(sec_url)
+            if not html or len(html) < 100:
+                raise ValueError("Empty or invalid HTML content received")
+        except Exception as scrape_error:
+            result['error'] = "Failed to scrape SEC filing"
+            status_dict[company_name]['status'] = 'Error'
+            status_dict[company_name]['stage'] = 'Scraping failed'
+            update_status_table(status_table_container, status_dict, all_companies)
+            
+            log_error(
+                original_company_name,
+                "HTML Scraping",
+                f"Failed to download or parse SEC filing: {str(scrape_error)}",
+                f"URL: {sec_url} | Ticker: {result['ticker']} | This could be network issues or SEC server problems"
+            )
+            return result
         
-        for script in soup(['script', 'style']):
-            script.decompose()
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            for script in soup(['script', 'style']):
+                script.decompose()
+            
+            text = soup.get_text()
+            lines = (line.strip() for line in text.splitlines())
+            text = '\n'.join(line for line in lines if line)
+            
+            if len(text) < 1000:
+                raise ValueError(f"Document too short ({len(text)} chars), likely parsing error")
+            
+            search_phrases = ['change in control', 'change of control']
+            text_blocks = extract_context_around_phrases(text, search_phrases, context_chars=1000)
+            relevant_text = '\n\n'.join(text_blocks)
+            
+            if not relevant_text or len(relevant_text) < 100:
+                raise ValueError(f"No 'change of control' text found in document. Document length: {len(text)} chars")
+                
+        except Exception as parse_error:
+            result['error'] = "Failed to extract text from SEC filing"
+            status_dict[company_name]['status'] = 'Error'
+            status_dict[company_name]['stage'] = 'Text extraction failed'
+            update_status_table(status_table_container, status_dict, all_companies)
+            
+            log_error(
+                original_company_name,
+                "Text Extraction",
+                f"Failed to parse document or find CoC phrases: {str(parse_error)}",
+                f"URL: {sec_url} | Ticker: {result['ticker']} | Document may not contain change of control provisions"
+            )
+            return result
         
-        text = soup.get_text()
-        lines = (line.strip() for line in text.splitlines())
-        text = '\n'.join(line for line in lines if line)
-        
-        search_phrases = ['change in control', 'change of control']
-        text_blocks = extract_context_around_phrases(text, search_phrases, context_chars=1000)
-        relevant_text = '\n\n'.join(text_blocks)
-        
-        analysis_result = await analyze(relevant_text)
+        try:
+            analysis_result = await analyze(relevant_text)
+        except Exception as openai_error:
+            result['error'] = "OpenAI analysis failed"
+            status_dict[company_name]['status'] = 'Error'
+            status_dict[company_name]['stage'] = 'AI analysis failed'
+            update_status_table(status_table_container, status_dict, all_companies)
+            
+            log_error(
+                original_company_name,
+                "OpenAI Analysis",
+                f"AI analysis failed: {str(openai_error)}",
+                f"Ticker: {result['ticker']} | Relevant text length: {len(relevant_text)} chars | Check API key and rate limits"
+            )
+            return result
         
         try:
             json_str = analysis_result
+            original_response = analysis_result[:500]  # Store first 500 chars for error logging
+            
             if '```json' in json_str:
                 json_str = json_str.split('```json')[1].split('```')[0].strip()
             elif '```' in json_str:
@@ -553,7 +657,11 @@ async def process_company_with_status_update(company_name: str, status_dict: dic
                 else:
                     json_str = '[' + json_str + ']'
             
-            payouts = json.loads(json_str)
+            try:
+                payouts = json.loads(json_str)
+            except json.JSONDecodeError as json_err:
+                raise ValueError(f"JSON parsing failed: {str(json_err)}. Parsed string: {json_str[:200]}")
+            
             if isinstance(payouts, dict):
                 payouts = [payouts]
             
@@ -561,7 +669,16 @@ async def process_company_with_status_update(company_name: str, status_dict: dic
             for payout in payouts:
                 amount = payout.get('amount', 0)
                 if isinstance(amount, str):
-                    amount = float(amount.replace(',', '').replace('$', ''))
+                    try:
+                        amount = float(amount.replace(',', '').replace('$', ''))
+                    except (ValueError, AttributeError) as amt_err:
+                        log_error(
+                            original_company_name,
+                            "Amount Conversion",
+                            f"Failed to convert amount '{amount}' to float",
+                            f"Ticker: {result['ticker']} | Payout: {payout}"
+                        )
+                        continue
                 total_payments += float(amount) if amount else 0
             
             if total_payments == 0:
@@ -569,6 +686,13 @@ async def process_company_with_status_update(company_name: str, status_dict: dic
                 status_dict[company_name]['status'] = 'Error'
                 status_dict[company_name]['stage'] = 'No CoC values found'
                 update_status_table(status_table_container, status_dict, all_companies)
+                
+                log_error(
+                    original_company_name,
+                    "CoC Value Extraction",
+                    "Total payments calculated as $0",
+                    f"Ticker: {result['ticker']} | Payouts parsed: {len(payouts)} | AI Response: {original_response}... | This could mean no payments or parsing failure"
+                )
                 return result
             
             percentage = (total_payments / market_cap) * 100
@@ -579,19 +703,36 @@ async def process_company_with_status_update(company_name: str, status_dict: dic
             result['stage'] = 'complete'
             
             # Save to database
-            if percentage > 0:
-                save_analysis_result(result)
+            try:
+                if percentage > 0:
+                    save_analysis_result(result)
+                    log_success(original_company_name, result['ticker'], percentage)
+            except Exception as db_error:
+                log_error(
+                    original_company_name,
+                    "Database Save",
+                    f"Failed to save to MongoDB: {str(db_error)}",
+                    f"Ticker: {result['ticker']} | Percentage: {percentage:.4f}% | Check MongoDB connection"
+                )
+                # Don't fail the whole process, just log the error
             
             status_dict[company_name]['status'] = 'Complete'
             status_dict[company_name]['stage'] = f'{percentage:.4f}%'
             status_dict[company_name]['percentage'] = percentage
             update_status_table(status_table_container, status_dict, all_companies)
         
-        except (json.JSONDecodeError, ValueError, TypeError, KeyError):
-            result['error'] = "Failed to find CoC values"
+        except (json.JSONDecodeError, ValueError, TypeError, KeyError) as parse_error:
+            result['error'] = "Failed to parse CoC values"
             status_dict[company_name]['status'] = 'Error'
             status_dict[company_name]['stage'] = 'Parse error'
             update_status_table(status_table_container, status_dict, all_companies)
+            
+            log_error(
+                original_company_name,
+                "JSON Parsing & Calculation",
+                f"Failed to parse AI response or calculate values: {str(parse_error)}",
+                f"Ticker: {result['ticker']} | AI Response: {original_response if 'original_response' in locals() else 'N/A'}... | Error type: {type(parse_error).__name__}"
+            )
             return result
         
     except Exception as e:
@@ -599,6 +740,14 @@ async def process_company_with_status_update(company_name: str, status_dict: dic
         status_dict[company_name]['status'] = 'Error'
         status_dict[company_name]['stage'] = str(e)[:50]
         update_status_table(status_table_container, status_dict, all_companies)
+        
+        # Log unexpected errors
+        log_error(
+            original_company_name,
+            "Unexpected Error",
+            f"Unhandled exception during processing: {str(e)}",
+            f"Exception type: {type(e).__name__} | Stage: {result.get('stage', 'unknown')} | Ticker: {result.get('ticker', 'N/A')}"
+        )
     
     return result
 
@@ -649,6 +798,33 @@ def update_status_table(container, status_dict: dict, company_order: List[str]):
     container.markdown(table_html, unsafe_allow_html=True)
 
 
+def create_csv_from_results(successful_results: List[Dict]) -> str:
+    """Create CSV content from successful results"""
+    import io
+    
+    # Create DataFrame
+    csv_data = []
+    for result in successful_results:
+        csv_data.append({
+            'Company Name': result.get('company_name', 'N/A'),
+            'Ticker': result.get('ticker', 'N/A'),
+            'Percentage of Market Cap': f"{result.get('percentage', 0):.4f}%",
+            'Percentage (Numeric)': result.get('percentage', 0),
+            'Market Cap ($)': result.get('market_cap', 0),
+            'Total CoC Payments ($)': result.get('total_payments', 0),
+            'Filing Date': result.get('filing_date', 'N/A'),
+            'DEF 14A URL': result.get('def14a_url', 'N/A')
+        })
+    
+    df = pd.DataFrame(csv_data)
+    
+    # Sort by percentage descending
+    df = df.sort_values('Percentage (Numeric)', ascending=False)
+    
+    # Convert to CSV
+    return df.to_csv(index=False)
+
+
 def display_batch_results_summary(results: List[Dict]):
     """Display summary and top N results from batch processing"""
     
@@ -664,12 +840,31 @@ def display_batch_results_summary(results: List[Dict]):
     # Check if processing was stopped early
     was_stopped = st.session_state.get('stop_requested', False) or (success_count + failed_count < total)
     
-    # Display summary cards
+    # Display summary header with download button
+    header_col1, header_col2 = st.columns([3, 1])
+    
+    with header_col1:
+        if was_stopped:
+            st.markdown("### 📊 Batch Processing Summary (Stopped)")
+        else:
+            st.markdown("### 📊 Batch Processing Summary")
+    
+    with header_col2:
+        if successful:
+            csv_content = create_csv_from_results(successful)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            st.download_button(
+                label="📥 Export CSV",
+                data=csv_content,
+                file_name=f"coc_analysis_{timestamp}.csv",
+                mime="text/csv",
+                width='stretch',
+                type="primary"
+            )
+    
     if was_stopped:
-        st.markdown("### 📊 Batch Processing Summary (Stopped)")
         st.info("⏸️ **Processing was stopped.** Results shown are for completed companies only.")
-    else:
-        st.markdown("### 📊 Batch Processing Summary")
+    
     st.markdown("<br>", unsafe_allow_html=True)
     
     cols = st.columns(4)
@@ -1103,10 +1298,10 @@ def batch_upload_tab():
                     company_names = df[column_name].dropna().astype(str).tolist()
                     company_names = [name.strip() for name in company_names if name.strip()]
                     
-                    # Limit to 200
-                    if len(company_names) > 200:
-                        st.warning(f"⚠️ Found {len(company_names)} companies. Limiting to first 200.")
-                        company_names = company_names[:200]
+                    # Limit to 1298
+                    if len(company_names) > 1298:
+                        st.warning(f"⚠️ Found {len(company_names)} companies. Limiting to first 1298.")
+                        company_names = company_names[:1298]
                     
                     st.success(f"✅ Found {len(company_names)} companies to analyze")
                     
@@ -1200,7 +1395,7 @@ def batch_upload_tab():
         3. Click "Analyze All Companies" to start batch processing
         4. View results and top performers when complete
         
-        **⚠️ Note:** Maximum 200 companies per batch
+        **⚠️ Note:** Maximum 1298 companies per batch
         """)
 
 

@@ -60,7 +60,7 @@ async def process_first_row():
         text = '\n'.join(line for line in lines if line)
         
         # Extract context around "change in control" phrases
-        search_phrases = ['change in control', 'change of control']
+        search_phrases = ['change in control', 'change of control', 'salary', 'executive compensation', 'cic', 'termination']
         text_blocks = extract_context_around_phrases(text, search_phrases, context_chars=1000)
         
         # Combine text blocks
