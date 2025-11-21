@@ -338,12 +338,13 @@ async def process_company(company_name: str, status_placeholder=None) -> Dict:
         lines = (line.strip() for line in text.splitlines())
         text = '\n'.join(line for line in lines if line)
         
-        search_phrases = ['change in control', 'change of control']
-        text_blocks = extract_context_around_phrases(text, search_phrases, context_chars=1000)
-        relevant_text = '\n\n'.join(text_blocks)
+        # TEST: Send whole document instead of filtered text
+        # search_phrases = ['change in control', 'change of control']
+        # text_blocks = extract_context_around_phrases(text, search_phrases, context_chars=2000)
+        # relevant_text = '\n\n'.join(text_blocks)
         
-        # Analyze with OpenAI
-        analysis_result = await analyze(relevant_text)
+        # Analyze with OpenAI - using full document text
+        analysis_result = await analyze(text)
         
         # Parse and calculate
         try:
@@ -354,24 +355,51 @@ async def process_company(company_name: str, status_placeholder=None) -> Dict:
                 json_str = json_str.split('```')[1].split('```')[0].strip()
             
             json_str = json_str.strip()
-            if json_str.startswith('{') and not json_str.startswith('['):
-                if '}\n{' in json_str or '},\n{' in json_str:
-                    json_str = '[' + json_str.replace('}\n{', '},\n{').replace('},\n{', '},\n{') + ']'
+            
+            try:
+                parsed_data = json.loads(json_str)
+            except json.JSONDecodeError as json_err:
+                result['error'] = f"Failed to parse JSON response: {str(json_err)}"
+                if status_placeholder:
+                    status_placeholder.error(f"❌ {result['error']}")
+                return result
+            
+            # Handle new format: {found, per_exec, team_total_usd}
+            if isinstance(parsed_data, dict) and 'found' in parsed_data:
+                if not parsed_data.get('found', False):
+                    result['error'] = parsed_data.get('reason_if_not_found', 'No CoC values found')
+                    if status_placeholder:
+                        status_placeholder.error(f"❌ {result['error']}")
+                    return result
+                
+                # Extract from per_exec array
+                per_exec = parsed_data.get('per_exec', [])
+                if not per_exec:
+                    result['error'] = "No executives found in CoC analysis"
+                    if status_placeholder:
+                        status_placeholder.error(f"❌ {result['error']}")
+                    return result
+                
+                # Use team_total_usd if available, otherwise sum per_exec
+                if parsed_data.get('team_total_usd'):
+                    total_payments = float(parsed_data['team_total_usd'])
                 else:
-                    json_str = '[' + json_str + ']'
-            
-            payouts = json.loads(json_str)
-            if isinstance(payouts, dict):
-                payouts = [payouts]
-            
-            # Ensure all amounts are numeric and handle potential string values
-            total_payments = 0
-            for payout in payouts:
-                amount = payout.get('amount', 0)
-                # Convert to float if it's a string or int
-                if isinstance(amount, str):
-                    amount = float(amount.replace(',', '').replace('$', ''))
-                total_payments += float(amount) if amount else 0
+                    total_payments = sum(float(exec.get('total_usd', 0)) for exec in per_exec)
+                
+                # Convert to old format for compatibility
+                payouts = [{'name': exec.get('name', 'Unknown'), 'amount': exec.get('total_usd', 0)} for exec in per_exec]
+            else:
+                # Handle old format: array of {amount, name}
+                if isinstance(parsed_data, dict):
+                    parsed_data = [parsed_data]
+                
+                payouts = parsed_data
+                total_payments = 0
+                for payout in payouts:
+                    amount = payout.get('amount', 0)
+                    if isinstance(amount, str):
+                        amount = float(amount.replace(',', '').replace('$', ''))
+                    total_payments += float(amount) if amount else 0
             
             # If we got 0 total, the analysis likely failed to extract values
             if total_payments == 0:
@@ -604,12 +632,13 @@ async def process_company_with_status_update(company_name: str, status_dict: dic
             if len(text) < 1000:
                 raise ValueError(f"Document too short ({len(text)} chars), likely parsing error")
             
-            search_phrases = ['change in control', 'change of control']
-            text_blocks = extract_context_around_phrases(text, search_phrases, context_chars=1000)
-            relevant_text = '\n\n'.join(text_blocks)
-            
-            if not relevant_text or len(relevant_text) < 100:
-                raise ValueError(f"No 'change of control' text found in document. Document length: {len(text)} chars")
+            # TEST: Send whole document instead of filtered text
+            # search_phrases = ['change in control', 'change of control']
+            # text_blocks = extract_context_around_phrases(text, search_phrases, context_chars=1000)
+            # relevant_text = '\n\n'.join(text_blocks)
+            # 
+            # if not relevant_text or len(relevant_text) < 100:
+            #     raise ValueError(f"No 'change of control' text found in document. Document length: {len(text)} chars")
                 
         except Exception as parse_error:
             result['error'] = "Failed to extract text from SEC filing"
@@ -626,7 +655,8 @@ async def process_company_with_status_update(company_name: str, status_dict: dic
             return result
         
         try:
-            analysis_result = await analyze(relevant_text)
+            # TEST: Using full document text instead of filtered relevant_text
+            analysis_result = await analyze(text)
         except Exception as openai_error:
             result['error'] = "OpenAI analysis failed"
             status_dict[company_name]['status'] = 'Error'
@@ -637,7 +667,7 @@ async def process_company_with_status_update(company_name: str, status_dict: dic
                 original_company_name,
                 "OpenAI Analysis",
                 f"AI analysis failed: {str(openai_error)}",
-                f"Ticker: {result['ticker']} | Relevant text length: {len(relevant_text)} chars | Check API key and rate limits"
+                f"Ticker: {result['ticker']} | Document text length: {len(text)} chars | Check API key and rate limits"
             )
             return result
         
@@ -651,35 +681,59 @@ async def process_company_with_status_update(company_name: str, status_dict: dic
                 json_str = json_str.split('```')[1].split('```')[0].strip()
             
             json_str = json_str.strip()
-            if json_str.startswith('{') and not json_str.startswith('['):
-                if '}\n{' in json_str or '},\n{' in json_str:
-                    json_str = '[' + json_str.replace('}\n{', '},\n{').replace('},\n{', '},\n{') + ']'
-                else:
-                    json_str = '[' + json_str + ']'
             
             try:
-                payouts = json.loads(json_str)
+                parsed_data = json.loads(json_str)
             except json.JSONDecodeError as json_err:
                 raise ValueError(f"JSON parsing failed: {str(json_err)}. Parsed string: {json_str[:200]}")
             
-            if isinstance(payouts, dict):
-                payouts = [payouts]
-            
-            total_payments = 0
-            for payout in payouts:
-                amount = payout.get('amount', 0)
-                if isinstance(amount, str):
-                    try:
-                        amount = float(amount.replace(',', '').replace('$', ''))
-                    except (ValueError, AttributeError) as amt_err:
-                        log_error(
-                            original_company_name,
-                            "Amount Conversion",
-                            f"Failed to convert amount '{amount}' to float",
-                            f"Ticker: {result['ticker']} | Payout: {payout}"
-                        )
-                        continue
-                total_payments += float(amount) if amount else 0
+            # Handle new format: {found, per_exec, team_total_usd}
+            if isinstance(parsed_data, dict) and 'found' in parsed_data:
+                if not parsed_data.get('found', False):
+                    result['error'] = parsed_data.get('reason_if_not_found', 'No CoC values found')
+                    status_dict[company_name]['status'] = 'Error'
+                    status_dict[company_name]['stage'] = 'No CoC values found'
+                    update_status_table(status_table_container, status_dict, all_companies)
+                    return result
+                
+                # Extract from per_exec array
+                per_exec = parsed_data.get('per_exec', [])
+                if not per_exec:
+                    result['error'] = "No executives found in CoC analysis"
+                    status_dict[company_name]['status'] = 'Error'
+                    status_dict[company_name]['stage'] = 'No executives found'
+                    update_status_table(status_table_container, status_dict, all_companies)
+                    return result
+                
+                # Use team_total_usd if available, otherwise sum per_exec
+                if parsed_data.get('team_total_usd'):
+                    total_payments = float(parsed_data['team_total_usd'])
+                else:
+                    total_payments = sum(float(exec.get('total_usd', 0)) for exec in per_exec)
+                
+                # Convert to old format for compatibility
+                payouts = [{'name': exec.get('name', 'Unknown'), 'amount': exec.get('total_usd', 0)} for exec in per_exec]
+            else:
+                # Handle old format: array of {amount, name}
+                if isinstance(parsed_data, dict):
+                    parsed_data = [parsed_data]
+                
+                payouts = parsed_data
+                total_payments = 0
+                for payout in payouts:
+                    amount = payout.get('amount', 0)
+                    if isinstance(amount, str):
+                        try:
+                            amount = float(amount.replace(',', '').replace('$', ''))
+                        except (ValueError, AttributeError) as amt_err:
+                            log_error(
+                                original_company_name,
+                                "Amount Conversion",
+                                f"Failed to convert amount '{amount}' to float",
+                                f"Ticker: {result['ticker']} | Payout: {payout}"
+                            )
+                            continue
+                    total_payments += float(amount) if amount else 0
             
             if total_payments == 0:
                 result['error'] = "Failed to find CoC values"

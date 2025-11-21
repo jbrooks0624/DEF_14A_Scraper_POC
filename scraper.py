@@ -21,7 +21,6 @@ def scrape_html(url):
 
 
 def extract_context_around_phrases(text, phrases, context_chars=100):
-
     results = []
     text_lower = text.lower()
     
